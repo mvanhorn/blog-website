@@ -11,7 +11,15 @@ import { GetStaticPaths, GetStaticProps } from "next";
 import PostByAuthorMapping from "../../components/postByAuthorMapping";
 import { HOME_OG_IMAGE_URL } from "../../lib/constants";
 import { sanitizeAuthorSlug } from "../../utils/sanitizeAuthorSlug";
-import { getBreadcrumbListSchema, MAIN_SITE_URL, SITE_URL } from "../../lib/structured-data";
+import {
+  getBreadcrumbListSchema,
+  getItemListSchema,
+  getPersonSchema,
+  getProfilePageSchema,
+  SITE_URL,
+} from "../../lib/structured-data";
+import { extractAuthorBox } from "../../lib/author-box";
+import { REVALIDATE_CONTENT, REVALIDATE_ERROR, REVALIDATE_NOT_FOUND } from "../../lib/isr";
 
 export default function AuthorPage({ preview, filteredPosts, content }) {
   if (!filteredPosts || filteredPosts.length === 0) {
@@ -28,29 +36,30 @@ export default function AuthorPage({ preview, filteredPosts, content }) {
   const pageTitle = `${authorName} — Keploy Blog Author`;
   const pageDescription = `Read all articles by ${authorName} on the Keploy blog — covering software testing, API development, automation, and engineering best practices.`;
 
-  // Person JSON-LD for E-E-A-T author credibility (LIVE-11).
-  // AI models use Person.url + sameAs to resolve author identity and
-  // weight the authority of the pages they cite. worksFor.url points at
-  // MAIN_SITE_URL (https://keploy.io) — not the blog subpath — so the
-  // Organization entity is consistent across every JSON-LD payload.
-  const personSchema = {
-    "@context": "https://schema.org",
-    "@type": "Person",
+  // Person JSON-LD for E-E-A-T author credibility (LIVE-11). AI models use
+  // Person.url + sameAs to resolve author identity and weight the authority of
+  // the pages they cite. The node shape (incl. the worksFor Organization
+  // reference) is built by getPersonSchema in lib/structured-data.ts so it stays
+  // consistent with every other JSON-LD payload.
+  const authorMeta = extractAuthorBox(content);
+  const authoredItems = filteredPosts.map(({ node }) => ({
+    url: `${SITE_URL}/${node?.categories?.edges?.[0]?.node?.name === "community" ? "community" : "technology"}/${node.slug}`,
+    name: node.title,
+  }));
+
+  // Person + ProfilePage schema is built centrally in lib/structured-data.ts so
+  // the author's `#person` @id, worksFor affiliation, and node shape stay in sync
+  // with the per-post author node that references it. The author's posts are
+  // modeled as an ItemList so AI engines see the body of work.
+  const personNode = getPersonSchema({
     name: authorName,
     url: authorUrl,
-    jobTitle: "Contributor",
-    worksFor: {
-      "@type": "Organization",
-      name: "Keploy",
-      url: MAIN_SITE_URL,
-    },
-    knowsAbout: [
-      "API Testing",
-      "Test Automation",
-      "Software Engineering",
-      "Developer Tools",
-    ],
-  };
+    image: authorMeta.avatarUrl,
+    sameAs: authorMeta.linkedIn ? [authorMeta.linkedIn] : undefined,
+    description: authorMeta.bio,
+  });
+  const profilePageSchema = getProfilePageSchema(personNode, authorUrl);
+  const authoredWorksSchema = getItemListSchema(authoredItems, `Posts by ${authorName}`);
 
   return (
     <div className="bg-accent-1">
@@ -75,11 +84,12 @@ export default function AuthorPage({ preview, filteredPosts, content }) {
             { name: "Authors", url: `${SITE_URL}/authors` },
             { name: authorName, url: authorUrl },
           ]),
-          personSchema,
+          profilePageSchema,
+          ...(authoredWorksSchema ? [authoredWorksSchema] : []),
         ]}
         canonicalUrl={authorUrl}
       >
-        {/* DM Sans + Baloo 2 are preloaded globally in _document.tsx */}
+        {/* Fonts self-hosted via next/font in _app.tsx */}
         <Header />
         <Container>
           <PostByAuthorMapping filteredPosts={filteredPosts} Content={content} />
@@ -104,13 +114,13 @@ export const getStaticPaths: GetStaticPaths = async ({ }) => {
 
     return {
       paths,
-      fallback: true,
+      fallback: "blocking",
     };
   } catch (error) {
     console.error("authors/[slug] getStaticPaths error:", error);
     return {
       paths: [],
-      fallback: true,
+      fallback: "blocking",
     };
   }
 };
@@ -124,7 +134,7 @@ export const getStaticProps: GetStaticProps = async ({
   if (typeof slugParam !== "string" || slugParam.trim().length === 0) {
     return {
       notFound: true,
-      revalidate: 60,
+      revalidate: REVALIDATE_NOT_FOUND,
     };
   }
 
@@ -150,6 +160,13 @@ export const getStaticProps: GetStaticProps = async ({
 
   let filteredPosts = [];
 
+  // fetchAPI throws on GraphQL errors and on network failure, and every WP call
+  // below is individually caught — which makes "WordPress is down" look
+  // identical to "this author has no posts". They must not share a TTL: a
+  // genuine 404 should stick, but an outage must self-heal in a minute rather
+  // than pinning a real author page as a 404 for a day.
+  let wordpressFailed = false;
+
   for (const candidate of Array.from(candidateAuthorNames)) {
     if (!candidate) continue;
     try {
@@ -160,6 +177,7 @@ export const getStaticProps: GetStaticProps = async ({
         break;
       }
     } catch (error) {
+      wordpressFailed = true;
       console.error(`authors/[slug] failed to fetch posts for candidate "${candidate}":`, error);
     }
   }
@@ -176,6 +194,7 @@ export const getStaticProps: GetStaticProps = async ({
           return sanitizeAuthorSlug(candidateName) === sanitizeAuthorSlug(slugParam);
         }) || [];
     } catch (error) {
+      wordpressFailed = true;
       console.error("authors/[slug] fallback to getAllPosts failed:", error);
       filteredPosts = [];
     }
@@ -185,7 +204,7 @@ export const getStaticProps: GetStaticProps = async ({
   if (!filteredPosts.length) {
     return {
       notFound: true,
-      revalidate: 60,
+      revalidate: wordpressFailed ? REVALIDATE_ERROR : REVALIDATE_NOT_FOUND,
     };
   }
 
@@ -205,7 +224,7 @@ export const getStaticProps: GetStaticProps = async ({
       filteredPosts,
       content,
     },
-    revalidate: 60,
+    revalidate: REVALIDATE_CONTENT,
   };
 };
 
